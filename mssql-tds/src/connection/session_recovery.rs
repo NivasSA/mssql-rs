@@ -67,7 +67,9 @@ impl RecoveryContext {
 
     /// Initialize recovery context with connection-time settings.
     /// Called after a successful login to capture the original connection parameters
-    /// needed for reconnection validation and orchestration.
+    /// needed for reconnection validation and orchestration, and to seed the
+    /// baseline session state a reconnect's LOGIN7 must replay.
+    #[allow(clippy::too_many_arguments)]
     pub fn initialize(
         &mut self,
         client_context: ClientContext,
@@ -75,12 +77,26 @@ impl RecoveryContext {
         server_version: Option<Version>,
         encryption_level: NegotiatedEncryptionSetting,
         mars_enabled: bool,
+        session_recovery_negotiated: bool,
+        initial_database: String,
+        initial_language: String,
+        initial_collation: SqlCollation,
+        initial_state_tokens: &[SessionStateToken],
+        initial_state_ack: Option<&[u8]>,
     ) {
         self.client_context = Some(Box::new(client_context));
         self.original_tds_version = tds_version;
         self.original_server_version = server_version;
         self.original_encryption_level = Some(encryption_level);
         self.original_mars_enabled = mars_enabled;
+        self.session_recovery_negotiated = session_recovery_negotiated;
+        self.session_state_table.seed_initial_state(
+            initial_database,
+            initial_language,
+            initial_collation,
+            initial_state_tokens,
+            initial_state_ack,
+        );
     }
 
     /// Check whether session recovery can be attempted.
@@ -283,6 +299,82 @@ impl SessionStateTable {
             sequence,
             data,
         });
+    }
+
+    /// Seed the baseline snapshot captured at login.
+    ///
+    /// Called once, right after a successful login, with the database/language/
+    /// collation negotiated at connect time and any SESSIONSTATE tokens the
+    /// server sent during login. Without this, `initial_*` stays empty and a
+    /// reconnect's LOGIN7 session-recovery block goes out blank, which servers
+    /// reject.
+    pub fn seed_initial_state(
+        &mut self,
+        database: String,
+        language: String,
+        collation: SqlCollation,
+        tokens: &[SessionStateToken],
+        feature_ack_initial_state: Option<&[u8]>,
+    ) {
+        self.initial_database = database;
+        self.initial_language = language;
+        self.initial_collation = collation;
+
+        for token in tokens {
+            if token.sequence_number == u32::MAX {
+                self.master_recovery_disabled = true;
+                continue;
+            }
+            for entry in &token.states {
+                if !entry.recoverable {
+                    self.unrecoverable_state_count += 1;
+                }
+                self.initial_state[entry.state_id as usize] = Some(SessionStateRecord {
+                    recoverable: entry.recoverable,
+                    sequence: token.sequence_number,
+                    data: entry.data.clone(),
+                });
+            }
+        }
+
+        // The server delivers the recoverable baseline as a packed FEATUREEXTACK
+        // payload, not SESSIONSTATE tokens. Each entry must be echoed in the
+        // reconnect LOGIN7 or the server rejects it as semantically invalid
+        // (error 17897, state 81).
+        if let Some(data) = feature_ack_initial_state {
+            self.seed_initial_state_from_feature_ack(data);
+        }
+    }
+
+    /// Parse the packed FEATUREEXTACK session-recovery baseline into
+    /// `initial_state`. Entry format matches the reconnect wire format:
+    /// StateId (1 byte), Length (1 byte, or `0xFF` followed by a u32), Value.
+    fn seed_initial_state_from_feature_ack(&mut self, data: &[u8]) {
+        let mut i = 0;
+        while i < data.len() {
+            let state_id = data[i] as usize;
+            i += 1;
+            let Some(&len_byte) = data.get(i) else { break };
+            i += 1;
+            let len = if len_byte == 0xFF {
+                let Some(bytes) = data.get(i..i + 4) else {
+                    break;
+                };
+                i += 4;
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
+            } else {
+                len_byte as usize
+            };
+            let Some(value) = data.get(i..i + len) else {
+                break;
+            };
+            i += len;
+            self.initial_state[state_id] = Some(SessionStateRecord {
+                recoverable: true,
+                sequence: 0,
+                data: value.to_vec(),
+            });
+        }
     }
 
     /// Returns `true` if the session can be recovered after a disconnect.
@@ -538,6 +630,96 @@ mod tests {
     }
 
     #[test]
+    fn seed_from_feature_ack_parses_server_baseline() {
+        // The 8-entry baseline the server sent in the SESSIONRECOVERY
+        // FEATUREEXTACK at login (captured from the wire). Dropping any of
+        // these makes the reconnect LOGIN7 fail with error 17897, state 81.
+        let ack = vec![
+            0x00, 0x09, 0x00, 0x60, 0x81, 0x14, 0xFF, 0xE7, 0xFF, 0xFF, 0x00, // id 0, len 9
+            0x02, 0x02, 0x07, 0x01, // id 2, len 2
+            0x04, 0x01, 0x00, // id 4, len 1
+            0x05, 0x04, 0xFF, 0xFF, 0xFF, 0xFF, // id 5, len 4
+            0x06, 0x01, 0x00, // id 6, len 1
+            0x07, 0x01, 0x02, // id 7, len 1
+            0x08, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // id 8, len 8
+            0x09, 0x04, 0xFF, 0xFF, 0xFF, 0xFF, // id 9, len 4
+        ];
+        let mut table = SessionStateTable::new();
+        table.seed_initial_state_from_feature_ack(&ack);
+
+        for (id, expected) in [
+            (
+                0usize,
+                vec![0x00, 0x60, 0x81, 0x14, 0xFF, 0xE7, 0xFF, 0xFF, 0x00],
+            ),
+            (2, vec![0x07, 0x01]),
+            (4, vec![0x00]),
+            (5, vec![0xFF, 0xFF, 0xFF, 0xFF]),
+            (6, vec![0x00]),
+            (7, vec![0x02]),
+            (8, vec![0x00; 8]),
+            (9, vec![0xFF, 0xFF, 0xFF, 0xFF]),
+        ] {
+            let record = table.initial_state[id]
+                .as_ref()
+                .unwrap_or_else(|| panic!("state {id} missing"));
+            assert_eq!(record.data, expected);
+            assert!(record.recoverable);
+            assert_eq!(record.sequence, 0);
+        }
+        // Gaps stay empty and the session remains recoverable.
+        assert!(table.initial_state[1].is_none());
+        assert!(table.initial_state[3].is_none());
+        assert!(table.is_session_recoverable());
+    }
+
+    #[test]
+    fn seed_from_feature_ack_extended_length() {
+        // Values >= 0xFF use the 0xFF marker followed by a u32 length.
+        let mut ack = vec![10u8, 0xFF];
+        ack.extend_from_slice(&300u32.to_le_bytes());
+        ack.extend_from_slice(&[0xAB; 300]);
+
+        let mut table = SessionStateTable::new();
+        table.seed_initial_state_from_feature_ack(&ack);
+
+        let record = table.initial_state[10].as_ref().unwrap();
+        assert_eq!(record.data.len(), 300);
+        assert!(record.data.iter().all(|&b| b == 0xAB));
+    }
+
+    #[test]
+    fn seed_from_feature_ack_truncated_is_safe() {
+        // A complete entry followed by one whose declared length runs past the
+        // buffer: the good entry is kept, the truncated one dropped, no panic.
+        let ack = vec![3, 1, 0xAA, 5, 10, 0x01];
+        let mut table = SessionStateTable::new();
+        table.seed_initial_state_from_feature_ack(&ack);
+
+        assert_eq!(table.initial_state[3].as_ref().unwrap().data, vec![0xAA]);
+        assert!(table.initial_state[5].is_none());
+    }
+
+    #[test]
+    fn seed_initial_state_forwards_feature_ack() {
+        let ack = vec![7, 2, 0x01, 0x02];
+        let mut table = SessionStateTable::new();
+        table.seed_initial_state(
+            "master".to_string(),
+            "us_english".to_string(),
+            SqlCollation::default(),
+            &[],
+            Some(&ack),
+        );
+
+        assert_eq!(table.initial_database, "master");
+        assert_eq!(
+            table.initial_state[7].as_ref().unwrap().data,
+            vec![0x01, 0x02]
+        );
+    }
+
+    #[test]
     fn reset_preserves_master_recovery_disabled() {
         let mut table = SessionStateTable::new();
         table.master_recovery_disabled = true;
@@ -707,8 +889,13 @@ mod tests {
             Some(Version::new(16, 0, 1000, 0)),
             NegotiatedEncryptionSetting::Mandatory,
             false,
+            true,
+            "master".to_string(),
+            "us_english".to_string(),
+            SqlCollation::default(),
+            &[],
+            None,
         );
-        ctx.session_recovery_negotiated = true;
         ctx
     }
 

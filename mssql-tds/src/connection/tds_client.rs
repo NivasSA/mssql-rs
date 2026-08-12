@@ -23,7 +23,7 @@ use crate::message::transaction_management::{
     TransactionManagementType,
 };
 use crate::query::result::ReturnValue;
-use crate::token::tokens::SqlCollation;
+use crate::token::tokens::{SessionStateToken, SqlCollation};
 use crate::{
     connection::{
         execution_context::{ALREADY_EXECUTING_ERROR, ExecutionContext},
@@ -183,6 +183,7 @@ impl TdsClient {
         negotiated_settings: NegotiatedSettings,
         execution_context: ExecutionContext,
         client_context: ClientContext,
+        login_session_state_tokens: Vec<SessionStateToken>,
     ) -> Self {
         let mut recovery_context = RecoveryContext::new();
         recovery_context.initialize(
@@ -193,6 +194,12 @@ impl TdsClient {
                 .session_settings
                 .negotiated_encryption_settings,
             negotiated_settings.session_settings.mars_enabled,
+            negotiated_settings.is_session_recovery_acknowledged(),
+            negotiated_settings.database.clone(),
+            negotiated_settings.language.clone(),
+            negotiated_settings.database_collation,
+            &login_session_state_tokens,
+            negotiated_settings.session_recovery_initial_state(),
         );
 
         Self {
@@ -323,7 +330,13 @@ impl TdsClient {
             )
             .await;
             match connect_result {
-                Ok((new_transport, new_settings, new_exec_ctx, info_messages)) => {
+                Ok((
+                    new_transport,
+                    new_settings,
+                    new_exec_ctx,
+                    info_messages,
+                    _session_state_tokens,
+                )) => {
                     // Validate reconnection properties match original
                     if let Err(validation_err) =
                         self.recovery_context.validate_reconnection(&new_settings)
@@ -4421,6 +4434,7 @@ mod tests {
             negotiated_settings,
             execution_context,
             client_context,
+            Vec::new(),
         )
     }
 
@@ -4465,6 +4479,7 @@ mod tests {
             negotiated_settings,
             execution_context,
             client_context,
+            Vec::new(),
         )
     }
 
@@ -4482,6 +4497,7 @@ mod tests {
             negotiated_settings,
             execution_context,
             client_context,
+            Vec::new(),
         );
         (client, sent)
     }

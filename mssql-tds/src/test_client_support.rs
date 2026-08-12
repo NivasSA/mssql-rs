@@ -187,6 +187,7 @@ pub fn tds_client_from_tokens(tokens: Vec<ScriptedToken>) -> TdsClient {
         negotiated_settings,
         execution_context,
         client_context,
+        Vec::new(),
     )
 }
 

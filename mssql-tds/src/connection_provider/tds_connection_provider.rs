@@ -22,6 +22,7 @@ use crate::error::{Error, SqlInfoMessage, TimeoutErrorType};
 use crate::handler::handler_factory::HandlerFactory;
 use crate::io::token_stream::GenericTokenParserRegistry;
 use crate::ssrp;
+use crate::token::tokens::SessionStateToken;
 
 #[cfg(fuzzing)]
 use crate::io::token_stream::TdsTokenStreamReader;
@@ -60,9 +61,20 @@ impl TdsConnectionProvider {
             + crate::io::packet_reader::TdsPacketReader
             + 'static,
     {
-        let (transport, negotiated_settings, execution_context, info_messages) =
-            Self::connect_with_transport(&context, &context.transport_context, transport).await?;
-        let mut client = TdsClient::new(transport, negotiated_settings, execution_context, context);
+        let (
+            transport,
+            negotiated_settings,
+            execution_context,
+            info_messages,
+            session_state_tokens,
+        ) = Self::connect_with_transport(&context, &context.transport_context, transport).await?;
+        let mut client = TdsClient::new(
+            transport,
+            negotiated_settings,
+            execution_context,
+            context,
+            session_state_tokens,
+        );
         client.extend_info_messages(info_messages);
         Ok(client)
     }
@@ -177,13 +189,14 @@ impl TdsConnectionProvider {
                     None => connect_future.await,
                 };
                 match sm_result {
-                    Ok((transport, negotiated_settings, execution_context, info_messages)) => {
+                    Ok((transport, negotiated_settings, execution_context, info_messages, session_state_tokens)) => {
                         debug!("Shared Memory connection succeeded, skipping SSRP");
                         let mut client = TdsClient::new(
                             transport,
                             negotiated_settings,
                             execution_context,
                             context.clone(),
+                            session_state_tokens,
                         );
                         client.extend_info_messages(info_messages);
                         return Ok(client);
@@ -371,13 +384,14 @@ impl TdsConnectionProvider {
                     // Handle redirections
                     loop {
                         match connection_result {
-                            Ok((transport, negotiated_settings, execution_context, info_messages)) => {
+                            Ok((transport, negotiated_settings, execution_context, info_messages, session_state_tokens)) => {
                                 debug!("Connection successful via action chain");
                                 let mut client = TdsClient::new(
                                     transport,
                                     negotiated_settings,
                                     execution_context,
                                     context.clone(),
+                                    session_state_tokens,
                                 );
                                 client.extend_info_messages(info_messages);
                                 return Ok(client);
@@ -544,6 +558,7 @@ impl TdsConnectionProvider {
         crate::handler::handler_factory::NegotiatedSettings,
         crate::connection::execution_context::ExecutionContext,
         Vec<SqlInfoMessage>,
+        Vec<SessionStateToken>,
     )> {
         // Create network transport directly
         // Convert connect_timeout from seconds to milliseconds
@@ -570,7 +585,7 @@ impl TdsConnectionProvider {
             .await;
 
         match session_result {
-            Ok((negotiated_settings, info_messages)) => {
+            Ok((negotiated_settings, info_messages, session_state_tokens)) => {
                 // Create execution context for the new connection
                 let execution_context =
                     crate::connection::execution_context::ExecutionContext::new();
@@ -580,6 +595,7 @@ impl TdsConnectionProvider {
                     negotiated_settings,
                     execution_context,
                     info_messages,
+                    session_state_tokens,
                 ))
             }
             Err(err) => {
@@ -603,6 +619,7 @@ impl TdsConnectionProvider {
         crate::handler::handler_factory::NegotiatedSettings,
         crate::connection::execution_context::ExecutionContext,
         Vec<SqlInfoMessage>,
+        Vec<SessionStateToken>,
     )>
     where
         T: TdsTransport
@@ -621,7 +638,7 @@ impl TdsConnectionProvider {
             .await;
 
         match session_result {
-            Ok((negotiated_settings, info_messages)) => {
+            Ok((negotiated_settings, info_messages, session_state_tokens)) => {
                 // Create execution context for the new connection
                 let execution_context =
                     crate::connection::execution_context::ExecutionContext::new();
@@ -631,6 +648,7 @@ impl TdsConnectionProvider {
                     negotiated_settings,
                     execution_context,
                     info_messages,
+                    session_state_tokens,
                 ))
             }
             Err(err) => {

@@ -756,5 +756,6 @@ pub fn create_fuzz_tds_client(
         negotiated_settings,
         execution_context,
         client_context,
+        Vec::new(),
     )
 }

@@ -189,6 +189,10 @@ impl Feature for SessionRecoveryFeature {
         Ok(())
     }
 
+    fn session_recovery_initial_state(&self) -> Option<&[u8]> {
+        self.initial_state_data.as_deref()
+    }
+
     fn is_acknowledged(&self) -> bool {
         self.acknowledged
     }
@@ -235,10 +239,15 @@ mod tests {
     fn deserialize_stores_initial_state_data() {
         let mut feature = SessionRecoveryFeature::new(1);
         assert!(feature.initial_state_data.is_none());
+        assert!(feature.session_recovery_initial_state().is_none());
 
         let data = vec![0x01, 0x02, 0x03];
         feature.deserialize(&data).unwrap();
         assert_eq!(feature.initial_state_data.as_ref().unwrap(), &data);
+        assert_eq!(
+            feature.session_recovery_initial_state(),
+            Some(data.as_slice())
+        );
     }
 
     #[test]

@@ -22,11 +22,6 @@
 class SessionRecoveryLiveTest : public ODBCTest {
 protected:
     void SetUp() override {
-        GTEST_SKIP() << "Disabled pending mssql-tds transparent-reconnect fix: "
-                        "the reconnection LOGIN7 is rejected by the server, so "
-                        "SQLExecute-after-KILL cannot recover yet. Re-enable when "
-                        "transparent reconnect succeeds end-to-end.";
-
         ODBCTest::SetUp();
         ASSERT_TRUE(ODBCTestConfig::Instance().HasConnection())
             << "No connection configured – set ODBC_TEST_SERVER or "
